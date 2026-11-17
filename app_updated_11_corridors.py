@@ -1,14 +1,36 @@
-from pathlib import Path
-import math
-import warnings
 
-import numpy as np
-import pandas as pd
-import streamlit as st
+import zipfile
+import urllib.request
+from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR = BASE_DIR / "data"
+CENSUS_DIR = DATA_DIR / "census_tracts"
+
+def ensure_census_tracts():
+    shp_file = CENSUS_DIR / "tl_2024_48_tract.shp"
+
+    if shp_file.exists():
+        return
+
+    CENSUS_DIR.mkdir(parents=True, exist_ok=True)
+
+    url = (
+        "https://www2.census.gov/geo/tiger/"
+        "TIGER2024/TRACT/tl_2024_48_tract.zip"
+    )
+
+    zip_path = CENSUS_DIR / "census_tracts.zip"
+
+    urllib.request.urlretrieve(url, zip_path)
+
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        zip_ref.extractall(CENSUS_DIR)
+
+    zip_path.unlink()
+
+ensure_census_tracts()
+
 
 CORRIDORS = {
     "South Congress Avenue (SoCo)": {"short": "SoCo", "center": (30.2474, -97.7495), "search_radius_m": 1800, "buffer_m": 120, "match": ["south congress avenue", "south congress"], "color": "#E76F51", "description": "Real-world profile: boutique and specialty retail, apparel and gifts, galleries, hotels, live music and visitor-oriented dining. Food is one part of a wider shopping and entertainment district."},
