@@ -1,36 +1,90 @@
-
-import zipfile
-import urllib.request
 from pathlib import Path
+import math
+import warnings
+import shutil
+import urllib.request
+import zipfile
 
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# Streamlit must be imported before any call to st.*.
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-CENSUS_DIR = DATA_DIR / "census_tracts"
+DATA_SUBDIR = BASE_DIR / "data"
 
-def ensure_census_tracts():
-    shp_file = CENSUS_DIR / "tl_2024_48_tract.shp"
+# The repository has historically stored many CSV/GeoJSON files at its root.
+# Prefer /data when it actually contains app data; otherwise use the repository root.
+_DATA_MARKERS = (
+    "soco_corridor_businesses.csv",
+    "Austin_Housing_Affordability.csv",
+    "housing_affordability_tract_summary.csv",
+    "boundary_soco.geojson",
+)
+if DATA_SUBDIR.is_dir() and any((DATA_SUBDIR / name).exists() for name in _DATA_MARKERS):
+    DATA_DIR = DATA_SUBDIR
+elif any((BASE_DIR / name).exists() for name in _DATA_MARKERS):
+    DATA_DIR = BASE_DIR
+else:
+    DATA_DIR = DATA_SUBDIR
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    if shp_file.exists():
-        return
+# Keep the TIGER tract files in the requested location, independent of where
+# the CSV and corridor GeoJSON files are stored.
+CENSUS_DIR = DATA_SUBDIR / "census_tracts"
+CENSUS_ZIP_URL = (
+    "https://www2.census.gov/geo/tiger/TIGER2024/TRACT/"
+    "tl_2024_48_tract.zip"
+)
+
+
+def ensure_census_tract_shapefile():
+    """Download and extract the official 2024 Texas TIGER tract shapefile once."""
+    required = [".shp", ".shx", ".dbf", ".prj"]
+    shp_path = CENSUS_DIR / "tl_2024_48_tract.shp"
+    if all((CENSUS_DIR / f"tl_2024_48_tract{suffix}").is_file() for suffix in required):
+        return shp_path
 
     CENSUS_DIR.mkdir(parents=True, exist_ok=True)
+    zip_path = CENSUS_DIR / "tl_2024_48_tract.zip"
+    partial_path = CENSUS_DIR / "tl_2024_48_tract.zip.part"
+    try:
+        # Stream the ZIP to disk rather than holding the 30+ MB file in memory.
+        request = urllib.request.Request(
+            CENSUS_ZIP_URL,
+            headers={"User-Agent": "Austin-Corridor-Intelligence/1.0"},
+        )
+        with urllib.request.urlopen(request, timeout=180) as response, partial_path.open("wb") as out_file:
+            shutil.copyfileobj(response, out_file)
+        partial_path.replace(zip_path)
 
-    url = (
-        "https://www2.census.gov/geo/tiger/"
-        "TIGER2024/TRACT/tl_2024_48_tract.zip"
-    )
+        if not zipfile.is_zipfile(zip_path):
+            raise ValueError("The Census download did not return a valid ZIP file.")
 
-    zip_path = CENSUS_DIR / "census_tracts.zip"
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            bad_member = archive.testzip()
+            if bad_member:
+                raise ValueError(f"The Census ZIP failed its integrity check at {bad_member}.")
+            # Extract only the expected TIGER files into the designated folder.
+            wanted = {f"tl_2024_48_tract{suffix}" for suffix in required + [".cpg"]}
+            for member in archive.namelist():
+                if Path(member).name in wanted:
+                    target = CENSUS_DIR / Path(member).name
+                    with archive.open(member) as source, target.open("wb") as target_file:
+                        shutil.copyfileobj(source, target_file)
 
-    urllib.request.urlretrieve(url, zip_path)
-
-    with zipfile.ZipFile(zip_path, "r") as zip_ref:
-        zip_ref.extractall(CENSUS_DIR)
-
-    zip_path.unlink()
-
-ensure_census_tracts()
-
+        missing = [suffix for suffix in required if not (CENSUS_DIR / f"tl_2024_48_tract{suffix}").is_file()]
+        if missing:
+            raise FileNotFoundError("The extracted Census ZIP is missing: " + ", ".join(missing))
+        return shp_path
+    except Exception:
+        # Leave a clear, recoverable state; the Housing page displays the reason.
+        if partial_path.exists():
+            partial_path.unlink(missing_ok=True)
+        raise
+    finally:
+        if zip_path.exists():
+            zip_path.unlink(missing_ok=True)
 
 CORRIDORS = {
     "South Congress Avenue (SoCo)": {"short": "SoCo", "center": (30.2474, -97.7495), "search_radius_m": 1800, "buffer_m": 120, "match": ["south congress avenue", "south congress"], "color": "#E76F51", "description": "Real-world profile: boutique and specialty retail, apparel and gifts, galleries, hotels, live music and visitor-oriented dining. Food is one part of a wider shopping and entertainment district."},
@@ -1535,12 +1589,24 @@ elif page == "Housing Affordability":
             "Research Boulevard (US 183)": ["boundary_research_blvd.geojson", "boundary_research_boulevard.geojson"],
             "Cameron Road": ["boundary_cameron_road.geojson"],
         }
-        tract_candidates = [DATA_DIR / "census_tracts" / "tl_2024_48_tract.shp"]
-        tract_dir = DATA_DIR / "census_tracts"
-        if tract_dir.exists():
-            tract_candidates += sorted(tract_dir.glob("*.shp"))
+        tract_candidates = [CENSUS_DIR / "tl_2024_48_tract.shp"]
+        # Also accept a manually extracted shapefile in the selected data directory.
+        alternate_tract_dir = DATA_DIR / "census_tracts"
+        if alternate_tract_dir.exists() and alternate_tract_dir != CENSUS_DIR:
+            tract_candidates += sorted(alternate_tract_dir.glob("*.shp"))
         tract_candidates += sorted(DATA_DIR.glob("*tract*.shp"))
-        tract_path = next((p for p in tract_candidates if p.exists()), None)
+        tract_path = next((p for p in tract_candidates if p.is_file()), None)
+        if tract_path is None:
+            try:
+                tract_path = ensure_census_tract_shapefile()
+                st.success("Downloaded and extracted the official 2024 Texas Census tract boundaries.")
+            except Exception as download_error:
+                st.warning(
+                    "The housing CSV is available, but the Census tract shapefile could not be downloaded automatically. "
+                    "Check that Streamlit Cloud can access the Census download, or add the extracted TIGER files to "
+                    "data/census_tracts/."
+                )
+                st.caption(f"Download detail: {download_error}")
         corridor_results = []
 
         if tract_path is not None:
@@ -1604,7 +1670,7 @@ elif page == "Housing Affordability":
             except Exception as exc:
                 st.error(f"Could not calculate corridor-wise housing indicators: {exc}")
         else:
-            st.warning("The housing CSV is available, but the Census tract shapefile was not found. Put the extracted TIGER files in data/census_tracts/ to calculate corridor-wise results.")
+            st.warning("The housing CSV is available, but the Census tract shapefile is still unavailable. Add the extracted TIGER files to data/census_tracts/ or check the app logs for the automatic download error.")
             st.code("data/census_tracts/tl_2024_48_tract.shp\ndata/census_tracts/tl_2024_48_tract.shx\ndata/census_tracts/tl_2024_48_tract.dbf\ndata/census_tracts/tl_2024_48_tract.prj", language="text")
 
         if corridor_results:
